@@ -4,6 +4,7 @@ import {
   clearReference,
   persistSnapshot,
   resultMatchesWorkspace,
+  selectionRespectsConstraints,
   type StoredSnapshot,
 } from '../core/persistence';
 import {
@@ -157,6 +158,13 @@ export function useSolverWorker(initial: {
         if (!resultMatchesWorkspace(pendingWorkspace, msg.result)) {
           pendingRef.current = null;
           failWith('求解结果未通过一致性校验（集合/收益/容量对不上），已丢弃；请重新计算');
+          return;
+        }
+        // 必选/排除合规是交付底线：遗漏必选或纳入排除的结果不得落地。
+        // （最优收益由求解器构造保证，无需在主线程重复求解核对。）
+        if (!selectionRespectsConstraints(pendingWorkspace, msg.result.selectedIds)) {
+          pendingRef.current = null;
+          failWith('求解结果未满足当前必选/排除约束，已丢弃；请重新计算');
           return;
         }
 

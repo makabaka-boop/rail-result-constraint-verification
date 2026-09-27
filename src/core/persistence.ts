@@ -6,7 +6,7 @@ import {
   type ReferenceMember,
   type ReferencePlan,
 } from './reference';
-import type { SolverResult } from './solver';
+import { solve, type SolverResult } from './solver';
 import type { Capacity, CapacityCalendarSegment, Job, JobStatus, Workspace } from './types';
 
 export interface StoredSnapshot {
@@ -273,8 +273,9 @@ function sameCalendar(a: CapacityCalendarSegment[], b: CapacityCalendarSegment[]
  *  - 逐格扫描得到的峰值占用与 peakOccupancy 一致，且每格不超有效容量；
  *  - peakCellLimit（若结果中存在）等于最早峰值格的有效容量。
  *
- * 不校验入选作业的必选/排除状态：同身份旧版本的结果在约束修改后本就应
- * 标记为“已过期”，不属于冒充当前结果。
+ * 不校验必选/排除合规与收益最优性：本函数同时服务于同身份旧版本快照
+ * （反映的是旧约束，标记“已过期”展示）。自称当前版本的结果必须另过
+ * resultIsDeliverable 的交付校验，不得仅凭本函数放行。
  */
 export function resultMatchesWorkspace(
   workspace: Workspace,
@@ -321,13 +322,77 @@ export function resultMatchesWorkspace(
   return true;
 }
 
-/** 快照与工作区是否配套：身份 + 版本 + 容量/日历 + 结果内容全部一致。 */
+/**
+ * 入选集合相对当前必选/排除约束的合规性：
+ *  - 所有必选作业必须入选（遗漏必选的排程不可交付）；
+ *  - 排除作业一律不得入选。
+ * 假设 selectedIds 指向的作业均已确认存在（见 resultMatchesWorkspace）；
+ * 幽灵 id 不影响本判定，但调用方应先完成存在性核对。
+ */
+export function selectionRespectsConstraints(
+  workspace: Workspace,
+  selectedIds: readonly string[],
+): boolean {
+  const selected = new Set(selectedIds);
+  for (const job of workspace.jobs) {
+    if (job.status === 'required' && !selected.has(job.id)) return false;
+    if (job.status === 'excluded' && selected.has(job.id)) return false;
+  }
+  return true;
+}
+
+/**
+ * 总收益的最优性核对：重新精确求解当前工作区（容量 + 容量日历 +
+ * 必选/排除约束），比较最优总收益。已采纳的参考方案只影响同收益
+ * 方案间的成员取舍，不改变最优收益值，故核对时无需携带参考。
+ * 必选集合不可行时任何“当前结果”都不可能存在，返回 false。
+ */
+export function resultHasOptimalBenefit(
+  workspace: Workspace,
+  result: Pick<SolverResult, 'totalBenefit'>,
+): boolean {
+  try {
+    const optimal = solve(workspace.jobs, workspace.capacity, workspace.capacityCalendar);
+    return optimal.totalBenefit === result.totalBenefit;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * “当前版本结果”的交付校验（恢复/展示/下载当前排程前的最后一道闸）：
+ * 在 resultMatchesWorkspace 的一致性核对之上，额外要求相对当前约束
+ * 合法且最优——必选全部入选、排除一律不入选、总收益等于当前约束下的
+ * 精确最优收益。内部自洽但次优、或遗漏必选/纳入排除的结果不得作为
+ * 当前排程交付。
+ *
+ * 仅适用于快照版本与工作区版本相等的情形；旧版本快照反映的是旧约束，
+ * 不属于本函数的判定范围（见 snapshotBelongsToWorkspace）。
+ */
+export function resultIsDeliverable(
+  workspace: Workspace,
+  result: Pick<
+    SolverResult,
+    'selectedIds' | 'totalBenefit' | 'peakOccupancy' | 'peakCellLimit' | 'capacity'
+  >,
+): boolean {
+  return (
+    resultMatchesWorkspace(workspace, result) &&
+    selectionRespectsConstraints(workspace, result.selectedIds) &&
+    resultHasOptimalBenefit(workspace, result)
+  );
+}
+
+/**
+ * 快照与工作区是否配套为“当前结果”：身份 + 版本 + 容量/日历一致，
+ * 且结果通过交付校验（必选/排除合规、总收益为当前精确最优）。
+ */
 export function snapshotMatchesWorkspace(snapshot: StoredSnapshot, workspace: Workspace): boolean {
   if (snapshot.workspaceDataId !== workspace.dataId) return false;
   if (snapshot.workspaceVersion !== workspace.version) return false;
   if (snapshot.capacity !== workspace.capacity) return false;
   if (!sameCalendar(snapshot.capacityCalendar, workspace.capacityCalendar)) return false;
-  return resultMatchesWorkspace(workspace, snapshot.result);
+  return resultIsDeliverable(workspace, snapshot.result);
 }
 
 /**
@@ -404,6 +469,10 @@ export function clearReference(): void {
  *    对象可配对，孤儿快照直接丢弃，绝不与新工作区混合；
  *  - 结构无效（畸形日历、非法状态、结果不完整、selectedIds 指向不存在
  *    的作业、收益/峰值对不上）的记录整体拒绝并清除，不渲染也不导出；
+ *  - 自称当前版本（与工作区 version 相等）的快照还必须通过交付校验：
+ *    必选全部入选、排除一律不入选、总收益等于当前约束下的精确最优——
+ *    内部自洽但次优、或遗漏必选/纳入排除的结果不得作为当前排程交付，
+ *    整体拒绝并清除；同身份旧版本快照只要求内容自洽（界面标记“已过期”）；
  *  - 参考方案独立按 dataId 配对：身份不明（旧格式无 dataId）或不匹配的
  *    参考记录直接删除，绝不作用于新工作区；参考不与快照绑定，
  *    快照过期/丢失不影响已采纳参考；
@@ -470,11 +539,17 @@ export function restoreSession(): RestoredSession {
 
   // 旧数据没有 dataId，版本号是唯一的配对线索：版本不一致不能配套
   const versionOk = !wsLegacy || snapshot.workspaceVersion === workspace.version;
+  // 自称当前版本（version 相等）的结果必须可交付：除一致性外还要求
+  // 必选全部入选、排除一律不入选、总收益等于当前约束下的精确最优；
+  // 旧版本快照反映的是旧约束，只要求仍是本批数据的一份自洽结果。
+  const isCurrentVersion = snapshot.workspaceVersion === workspace.version;
   const contentOk =
     versionOk &&
     snapshot.capacity === workspace.capacity &&
     sameCalendar(snapshot.capacityCalendar, workspace.capacityCalendar) &&
-    resultMatchesWorkspace(workspace, snapshot.result);
+    (isCurrentVersion
+      ? resultIsDeliverable(workspace, snapshot.result)
+      : resultMatchesWorkspace(workspace, snapshot.result));
 
   if (!contentOk) {
     removeItem(SNAPSHOT_KEY);

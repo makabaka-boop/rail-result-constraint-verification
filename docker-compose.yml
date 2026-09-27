@@ -1,0 +1,27 @@
+# 夜间铁路检修窗口排程 —— Docker Compose
+#
+# 用法：
+#   WEB_PORT=8080 docker compose up --build web
+#   （不设置时默认 8080，可用环境变量覆盖）
+#
+#   验收（一次性，跑完退出，退出码即测试结果）：
+#   docker compose up --build verify
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: rail-possession-scheduler-web
+    ports:
+      # 宿主机端口可用 WEB_PORT 覆盖；容器内固定 80
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: rail-possession-scheduler-verify
+    # 一次性验收服务：不监听端口，运行类型检查与 Vitest 后退出
+    restart: "no"
